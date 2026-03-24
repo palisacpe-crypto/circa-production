@@ -1,0 +1,602 @@
+"""
+Circa WhatsApp State Machine — Full Button UX
+──────────────────────────────────────────────
+Returns a list of responses. Each response is either:
+  - str  → plain text message (sent via send_whatsapp)
+  - dict → template signal (dispatched by main.py to the right template sender)
+
+Template signals use the format:
+  {"signal": "CATEGORIAS"}
+  {"signal": "PRODUCTOS", "categoria": "bebidas"}
+  {"signal": "PACK", "nombre": "...", "p6": 9.60, "p12": 18.00, "p24": 34.00}
+  {"signal": "CANTIDAD", "nombre": "...", "pack_label": "Pack 12", "precio": 18.00}
+  {"signal": "AGREGADO", "cantidad": 2, ...}
+  {"signal": "CARRITO", "items_text": "...", "total": 72.0, "financiable": 72.0}
+  {"signal": "MONTO", "linea": 500.0, "total": 72.0, "financiable": 72.0}
+  {"signal": "PLAZO", "monto": 72.0, ...}
+  {"signal": "MENU", "linea": 500.0}
+"""
+import json, hashlib, unicodedata, os
+from datetime import datetime, date, timedelta
+from app.services import db, messages as msg, fees
+from app.services.pin import check_pin
+from app.config import TWILIO_FROM
+
+
+def normalize(text: str) -> str:
+    text = (text or "").strip().upper()
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _app_base_url() -> str:
+    return os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/")
+
+def _bot_wa_number() -> str:
+    return TWILIO_FROM.replace("whatsapp:", "").replace("+", "").strip()
+
+def get_catalog_url(bodega_id: str) -> str:
+    return f"{_app_base_url()}/catalogo?b={bodega_id}"
+
+def get_pin_url(bodega_id: str, mode: str = "confirm") -> str:
+    return f"{_app_base_url()}/pin?b={bodega_id}&mode={mode}&to={_bot_wa_number()}"
+
+
+def _find_product_by_sku(bodega: dict, sku: str) -> dict | None:
+    """Find a catalog item by SKU for the bodega's distributor."""
+    items = (
+        db.sb.table("catalogo")
+        .select("*")
+        .eq("activo", True)
+        .eq("distribuidor_id", bodega["distribuidor_id"])
+        .eq("sku", sku)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return items[0] if items else None
+
+
+def _cart_total(cart: list) -> float:
+    return sum(i.get("subtotal", 0) for i in cart)
+
+
+def _cart_items_text(cart: list) -> str:
+    """Format cart items for the carrito template (max ~640 chars for WhatsApp)."""
+    lines = []
+    for i in cart:
+        lines.append(f"{i['cantidad']}x Pk{i['pack_size']} {i['nombre']} — S/{i['subtotal']:.2f}")
+    return "\n".join(lines) if lines else "(vacío)"
+
+
+def handle_message(telefono: str, body: str, media_url: str = None) -> list:
+    body_raw = (body or "").strip()
+    body_n = normalize(body_raw)
+
+    session = db.get_session(telefono)
+    bodega = db.get_bodega_by_phone(telefono)
+
+    # ── NO SESSION ──
+    if not session:
+        if bodega:
+            if bodega["estado"] == "activo":
+                db.upsert_session(telefono, "menu", {}, bodega["id"])
+                return [{"signal": "MENU", "linea": bodega["linea_disponible"]}]
+            else:
+                dist = (
+                    db.sb.table("distribuidores")
+                    .select("nombre_comercial")
+                    .eq("id", bodega["distribuidor_id"])
+                    .single()
+                    .execute()
+                    .data
+                )
+                db.upsert_session(telefono, "welcome", {}, bodega["id"])
+                return [
+                    msg.msg_welcome(
+                        bodega["nombre_comercial"] or bodega["razon_social"],
+                        bodega["linea_aprobada"],
+                        dist["nombre_comercial"],
+                    )
+                ]
+        return ["👋 Hola, este número no está pre-aprobado en Circa. Contacta a tu distribuidor."]
+
+    fase = session["fase"]
+    datos = json.loads(session["datos"]) if isinstance(session["datos"], str) else (session["datos"] or {})
+
+    # ═══ WELCOME ═══
+    if fase == "welcome":
+        if body_n in ("SI", "ACTIVAR", "1", "HOLA", "HI"):
+            db.upsert_session(telefono, "reg_ruc", datos, bodega["id"] if bodega else None)
+            return [msg.msg_pedir_ruc()]
+        return [msg.msg_welcome(bodega["nombre_comercial"], bodega["linea_aprobada"], "tu distribuidor")]
+
+    # ═══ RUC ═══
+    if fase == "reg_ruc":
+        if datos.get("ruc"):
+            if body_n in ("SI", "CONFIRMO", "CORRECTO"):
+                db.upsert_session(telefono, "reg_dni", datos, datos.get("bodega_id"))
+                return [msg.msg_pedir_dni()]
+            return ["Escribe *SI* si los datos son correctos, o *NO* para corregir."]
+
+        ruc = body_raw.replace(" ", "")
+        if len(ruc) != 11 or not ruc.isdigit() or ruc[:2] not in ("10", "20"):
+            return [msg.msg_ruc_invalido()]
+
+        bodega = db.get_bodega_by_ruc(ruc)
+        if not bodega:
+            return [msg.msg_ruc_no_encontrado()]
+
+        if bodega["telefono_whatsapp"] != telefono and bodega["telefono_whatsapp"] != f"+{telefono.lstrip('+')}":
+            return ["❌ Este RUC no está asociado a tu número de WhatsApp."]
+
+        datos["ruc"] = ruc
+        datos["bodega_id"] = bodega["id"]
+        db.upsert_session(telefono, "reg_ruc", datos, bodega["id"])
+        return [msg.msg_ruc_verificado(bodega["razon_social"], ruc, bodega["direccion_fiscal"], bodega["representante_legal"])]
+
+    # ═══ DNI ═══
+    if fase == "reg_dni":
+        if media_url or body_n in ("DNI", "FOTO", "LISTO", "SI"):
+            bodega = db.sb.table("bodegas").select("*").eq("id", datos["bodega_id"]).single().execute().data
+            if media_url:
+                db.update_bodega(datos["bodega_id"], {"dni_foto_url": media_url})
+            datos["dni_verified"] = True
+
+            # If this is a PIN reset, skip to reg_pin
+            if datos.get("is_reset"):
+                db.upsert_session(telefono, "reg_pin", datos, datos["bodega_id"])
+                pin_url = get_pin_url(datos["bodega_id"], "create")
+                return [f"✅ Identidad verificada.\n\n🔐 Crea tu nueva *clave Circa* con el teclado seguro:\n👉 {pin_url}"]
+
+            db.upsert_session(telefono, "reg_contrato", datos, datos["bodega_id"])
+            return [msg.msg_dni_verificado(bodega["representante_legal"], bodega["dni_representante"])]
+
+        if datos.get("is_reset"):
+            return ["📷 Envía una *foto de tu DNI* para verificar tu identidad.\nEscribe *MENU* para cancelar."]
+        return ["📷 Envía una *foto de tu DNI* o escribe *DNI* para simular."]
+
+    # ═══ CONTRATO ═══
+    if fase == "reg_contrato":
+        if body_n in ("SI", "VER", "CONTINUAR", "1") and not datos.get("contrato_shown"):
+            bodega = db.sb.table("bodegas").select("linea_aprobada").eq("id", datos["bodega_id"]).single().execute().data
+            db.upsert_session(telefono, "reg_contrato", {**datos, "contrato_shown": True}, datos["bodega_id"])
+            return [msg.msg_contrato(bodega["linea_aprobada"])]
+
+        if body_n == "ACEPTO" and datos.get("contrato_shown"):
+            contract_data = f"{datos['bodega_id']}|{telefono}|{datetime.utcnow().isoformat()}"
+            contract_hash = hashlib.sha256(contract_data.encode()).hexdigest()
+            db.sign_contract(datos["bodega_id"], contract_hash)
+            db.upsert_session(telefono, "reg_pin", datos, datos["bodega_id"])
+            pin_url = get_pin_url(datos["bodega_id"], "create")
+            return [
+                msg.msg_contrato_firmado(),
+                f"🔐 *Crea tu clave Circa*\n\nUsa el teclado seguro aquí:\n👉 {pin_url}\n\nTu clave debe ser de 4 dígitos y no puede usar números repetidos o consecutivos."
+            ]
+
+        if datos.get("contrato_shown"):
+            return ["Escribe *ACEPTO* para firmar el contrato digitalmente."]
+        return ["Escribe *SI* para ver los términos del servicio."]
+
+    # ═══ CREAR PIN ═══
+    if fase == "reg_pin":
+        pin_url = get_pin_url(datos["bodega_id"], "create")
+
+        if body_n == "PIN_CREADO":
+            bodega_pin = db.sb.table("bodegas").select("linea_disponible, pin_hash, estado").eq("id", datos["bodega_id"]).single().execute().data
+            if not bodega_pin or not bodega_pin.get("pin_hash"):
+                return [f"⚠️ No pudimos registrar tu clave todavía.\n\nIntenta nuevamente aquí:\n👉 {pin_url}"]
+
+            db.upsert_session(telefono, "menu", {}, datos["bodega_id"])
+            return [
+                "✅ ¡Tu cuenta Circa está activa!\n\nTu clave fue creada correctamente.",
+                {"signal": "MENU", "linea": bodega_pin["linea_disponible"]},
+            ]
+
+        return [f"🔐 *Crea tu clave Circa*\n\nUsa el teclado seguro aquí:\n👉 {pin_url}"]
+
+    # ═══════════════════════════════════════════════
+    # MENÚ PRINCIPAL
+    # ═══════════════════════════════════════════════
+    if fase == "menu":
+        if body_n in ("PEDIDO", "PEDIR", "COMPRAR", "1", "pedido"):
+            url = get_catalog_url(bodega["id"])
+            db.upsert_session(telefono, "catalogo", {"cart": datos.get("cart", [])}, bodega["id"])
+            return [
+                f"📦 *Catálogo de productos*\n\nAbre el catálogo, arma tu pedido y confirma:\n👉 {url}\n\nFiltra por *categoría* o *marca*.\nPrecios por pack (6, 12 o 24u).\nEl tag indica el vendedor.\n\nCuando termines, presiona *Financiar con Circa* en la web."
+            ]
+
+        if body_n in ("REPETIR", "4"):
+            if bodega.get("ultimo_pedido_items"):
+                items = json.loads(bodega["ultimo_pedido_items"]) if isinstance(bodega["ultimo_pedido_items"], str) else bodega["ultimo_pedido_items"]
+                db.save_carrito(bodega["id"], items)
+                db.upsert_session(telefono, "cart_review", {"cart": items}, bodega["id"])
+                total = _cart_total(items)
+                financiable = min(bodega["linea_disponible"], total)
+                return [{"signal": "CARRITO", "items_text": _cart_items_text(items), "total": total, "financiable": financiable}]
+            return ["No tienes un pedido anterior. Escribe *PEDIDO* para empezar."]
+
+        if body_n in ("LINEA", "2", "linea"):
+            return [
+                f"💰 *Tu línea de crédito:*\n\n"
+                f"Aprobada: S/{bodega['linea_aprobada']:.2f}\n"
+                f"Disponible: *S/{bodega['linea_disponible']:.2f}*\n"
+                f"Scoring: {bodega['scoring']}/100"
+            ]
+
+        if body_n in ("ESTADO", "3", "estado"):
+            pedidos = db.get_pedidos_activos(bodega["id"])
+            if not pedidos:
+                return ["No tienes pedidos activos. Escribe *PEDIDO* para hacer uno."]
+            lines = ["📋 *Tus pedidos activos:*\n"]
+            for p in pedidos:
+                lines.append(f"• {p['numero']} — {p['estado'].upper()} — S/{p['monto_total_credito']:.2f} — Vence {p['fecha_vencimiento']}")
+            return ["\n".join(lines)]
+
+        if body_n in ("PAGUE", "YA PAGUE"):
+            pedidos = db.get_pedidos_activos(bodega["id"])
+            entregados = [p for p in pedidos if p["estado"] == "entregado"]
+            if entregados:
+                p = entregados[0]
+                db.registrar_pago(p["id"], p["monto_total_credito"])
+                bodega_updated = db.sb.table("bodegas").select("linea_disponible").eq("id", bodega["id"]).single().execute().data
+                return [msg.msg_pago_recibido(p["monto_total_credito"], bodega_updated["linea_disponible"])]
+            return ["No tienes pagos pendientes."]
+
+        if body_n in ("OLVIDE", "RESET", "OLVIDE MI CLAVE", "CAMBIAR CLAVE"):
+            db.update_bodega(bodega["id"], {"pin_hash": None, "pin_intentos": 0, "pin_bloqueado_hasta": None})
+            db.upsert_session(telefono, "reg_dni", {"bodega_id": bodega["id"], "is_reset": True}, bodega["id"])
+            return ["🔐 Para resetear tu clave, envía una *foto de tu DNI* para verificar tu identidad.\n\n📷 Envía la foto como imagen en este chat."]
+
+        # Default: show menu again
+        return [{"signal": "MENU", "linea": bodega["linea_disponible"]}]
+
+    # ═══════════════════════════════════════════════
+    # CATÁLOGO: Elegir categoría
+    # ═══════════════════════════════════════════════
+    if fase == "catalogo":
+        # User selected a category from the list picker
+        category_map = {
+            "BEBIDAS": "bebidas", "bebidas": "bebidas",
+            "LACTEOS": "lacteos", "lacteos": "lacteos",
+            "ABARROTES": "abarrotes", "abarrotes": "abarrotes",
+            "CUIDADO": "cuidado", "cuidado": "cuidado",
+        }
+
+        if body_n in ("MENU", "VOLVER", "CANCELAR"):
+            db.upsert_session(telefono, "menu", {}, bodega["id"])
+            return [{"signal": "MENU", "linea": bodega["linea_disponible"]}]
+
+        if body_n in ("LISTO", "REVISAR", "CHECKOUT", "FINANCIAR", "revisar", "financiar"):
+            cart = datos.get("cart", [])
+            if cart:
+                total = _cart_total(cart)
+                financiable = min(bodega["linea_disponible"], total)
+                db.upsert_session(telefono, "cart_review", datos, bodega["id"])
+                return [{"signal": "CARRITO", "items_text": _cart_items_text(cart), "total": total, "financiable": financiable}]
+            return ["🛒 Tu carrito está vacío. Elige una categoría para empezar."]
+
+        cat_key = category_map.get(body_n) or category_map.get(body_raw.lower())
+        if cat_key:
+            db.upsert_session(telefono, "catalogo_producto", {**datos, "categoria": cat_key}, bodega["id"])
+            return [{"signal": "PRODUCTOS", "categoria": cat_key}]
+
+        # Default: show categories
+        return [{"signal": "CATEGORIAS"}]
+
+    # ═══════════════════════════════════════════════
+    # CATÁLOGO: Elegir producto (list picker response)
+    # ═══════════════════════════════════════════════
+    if fase == "catalogo_producto":
+        if body_n in ("MENU", "VOLVER", "CANCELAR", "CATEGORIAS", "VER CATEGORIAS", "agregar_mas"):
+            db.upsert_session(telefono, "catalogo", datos, bodega["id"])
+            return [{"signal": "CATEGORIAS"}]
+
+        # The user selected a product by SKU (ListResponseId = SKU)
+        sku = body_raw.strip()
+        product = _find_product_by_sku(bodega, sku)
+
+        if product:
+            datos["selected_product"] = {
+                "id": product["id"],
+                "sku": product["sku"],
+                "nombre": product["nombre"],
+                "marca": product["marca"],
+                "p6": float(product.get("precio_6", 0)),
+                "p12": float(product.get("precio_12", 0)),
+                "p24": float(product.get("precio_24", 0)),
+            }
+            db.upsert_session(telefono, "catalogo_pack", datos, bodega["id"])
+            p = datos["selected_product"]
+            return [{"signal": "PACK", "nombre": p["nombre"], "p6": p["p6"], "p12": p["p12"], "p24": p["p24"]}]
+
+        # Not a valid SKU — show products again
+        cat = datos.get("categoria", "bebidas")
+        return [{"signal": "PRODUCTOS", "categoria": cat}]
+
+    # ═══════════════════════════════════════════════
+    # CATÁLOGO: Elegir pack (quick reply response)
+    # ═══════════════════════════════════════════════
+    if fase == "catalogo_pack":
+        pack_map = {
+            "PACK_6": 6, "pack_6": 6, "PACK 6": 6, "6": 6,
+            "PACK_12": 12, "pack_12": 12, "PACK 12": 12, "12": 12,
+            "PACK_24": 24, "pack_24": 24, "PACK 24": 24, "24": 24,
+        }
+
+        if body_n in ("MENU", "VOLVER", "CANCELAR"):
+            db.upsert_session(telefono, "catalogo", datos, bodega["id"])
+            return [{"signal": "CATEGORIAS"}]
+
+        pack_size = pack_map.get(body_n) or pack_map.get(body_raw)
+        if pack_size:
+            p = datos["selected_product"]
+            precio = p[f"p{pack_size}"]
+            datos["selected_pack"] = pack_size
+            datos["selected_price"] = precio
+            db.upsert_session(telefono, "catalogo_cantidad", datos, bodega["id"])
+            return [{"signal": "CANTIDAD", "nombre": p["nombre"], "pack_label": f"Pack {pack_size}", "precio": precio}]
+
+        # Invalid — show pack selection again
+        p = datos["selected_product"]
+        return [{"signal": "PACK", "nombre": p["nombre"], "p6": p["p6"], "p12": p["p12"], "p24": p["p24"]}]
+
+    # ═══════════════════════════════════════════════
+    # CATÁLOGO: Elegir cantidad (quick reply response)
+    # ═══════════════════════════════════════════════
+    if fase == "catalogo_cantidad":
+        qty_map = {
+            "QTY_1": 1, "qty_1": 1, "1 PACK": 1, "1": 1,
+            "QTY_2": 2, "qty_2": 2, "2 PACKS": 2, "2": 2,
+            "QTY_3": 3, "qty_3": 3, "3 PACKS": 3, "3": 3,
+        }
+
+        if body_n in ("MENU", "VOLVER", "CANCELAR"):
+            db.upsert_session(telefono, "catalogo", datos, bodega["id"])
+            return [{"signal": "CATEGORIAS"}]
+
+        cantidad = qty_map.get(body_n) or qty_map.get(body_raw)
+
+        # Also allow typing any number
+        if not cantidad:
+            try:
+                num = int(body_raw)
+                if 1 <= num <= 20:
+                    cantidad = num
+            except ValueError:
+                pass
+
+        if cantidad:
+            p = datos["selected_product"]
+            pack_size = datos["selected_pack"]
+            precio = datos["selected_price"]
+            subtotal = round(precio * cantidad, 2)
+
+            # Get distributor name
+            dist = db.sb.table("distribuidores").select("nombre_comercial").eq("id", bodega["distribuidor_id"]).single().execute().data
+
+            # Add to cart
+            cart = datos.get("cart", [])
+            cart_item = {
+                "catalogo_id": p["id"],
+                "nombre": p["nombre"],
+                "marca": p["marca"],
+                "seller": dist["nombre_comercial"] if dist else "—",
+                "pack_size": pack_size,
+                "cantidad": cantidad,
+                "precio": precio,
+                "subtotal": subtotal,
+            }
+            cart.append(cart_item)
+            datos["cart"] = cart
+
+            # Save cart to DB
+            db.save_carrito(bodega["id"], cart)
+
+            cart_total = _cart_total(cart)
+
+            # Clean up selection state
+            datos.pop("selected_product", None)
+            datos.pop("selected_pack", None)
+            datos.pop("selected_price", None)
+            datos.pop("categoria", None)
+
+            db.upsert_session(telefono, "catalogo_agregado", datos, bodega["id"])
+            return [{
+                "signal": "AGREGADO",
+                "cantidad": cantidad,
+                "pack_label": f"Pack {pack_size}",
+                "nombre": p["nombre"],
+                "subtotal": subtotal,
+                "cart_total": cart_total,
+            }]
+
+        # Invalid — show quantity again
+        p = datos["selected_product"]
+        pack_size = datos["selected_pack"]
+        precio = datos["selected_price"]
+        return [{"signal": "CANTIDAD", "nombre": p["nombre"], "pack_label": f"Pack {pack_size}", "precio": precio}]
+
+    # ═══════════════════════════════════════════════
+    # CATÁLOGO: Post-agregar (quick reply response)
+    # ═══════════════════════════════════════════════
+    if fase == "catalogo_agregado":
+        if body_n in ("AGREGAR_MAS", "agregar_mas", "AGREGAR", "MAS", "1"):
+            db.upsert_session(telefono, "catalogo", datos, bodega["id"])
+            return [{"signal": "CATEGORIAS"}]
+
+        if body_n in ("REVISAR", "revisar", "CARRITO", "2"):
+            cart = datos.get("cart", [])
+            total = _cart_total(cart)
+            financiable = min(bodega["linea_disponible"], total)
+            db.upsert_session(telefono, "cart_review", datos, bodega["id"])
+            return [{"signal": "CARRITO", "items_text": _cart_items_text(cart), "total": total, "financiable": financiable}]
+
+        if body_n in ("FINANCIAR", "financiar", "3"):
+            cart = datos.get("cart", [])
+            total = _cart_total(cart)
+            financiable = min(bodega["linea_disponible"], total)
+            db.upsert_session(telefono, "fin_amt", datos, bodega["id"])
+            return [{"signal": "MONTO", "linea": bodega["linea_disponible"], "total": total, "financiable": financiable}]
+
+        # Default — show agregar options again
+        cart = datos.get("cart", [])
+        cart_total = _cart_total(cart)
+        last_item = cart[-1] if cart else None
+        if last_item:
+            return [{
+                "signal": "AGREGADO",
+                "cantidad": last_item["cantidad"],
+                "pack_label": f"Pack {last_item['pack_size']}",
+                "nombre": last_item["nombre"],
+                "subtotal": last_item["subtotal"],
+                "cart_total": cart_total,
+            }]
+        db.upsert_session(telefono, "catalogo", datos, bodega["id"])
+        return [{"signal": "CATEGORIAS"}]
+
+    # ═══════════════════════════════════════════════
+    # REVISIÓN CARRITO
+    # ═══════════════════════════════════════════════
+    if fase == "cart_review":
+        cart = datos.get("cart", [])
+
+        if body_n in ("FINANCIAR", "financiar", "SI", "1"):
+            total = _cart_total(cart)
+            financiable = min(bodega["linea_disponible"], total)
+            db.upsert_session(telefono, "fin_amt", datos, bodega["id"])
+            return [{"signal": "MONTO", "linea": bodega["linea_disponible"], "total": total, "financiable": financiable}]
+
+        if body_n in ("AGREGAR_MAS", "agregar_mas", "AGREGAR", "MAS", "VOLVER"):
+            db.upsert_session(telefono, "catalogo", datos, bodega["id"])
+            return [{"signal": "CATEGORIAS"}]
+
+        if body_n in ("VACIAR", "vaciar", "BORRAR"):
+            datos["cart"] = []
+            db.clear_carrito(bodega["id"])
+            db.upsert_session(telefono, "catalogo", datos, bodega["id"])
+            return ["🗑 Carrito vaciado.", {"signal": "CATEGORIAS"}]
+
+        # Default — show cart again
+        total = _cart_total(cart)
+        financiable = min(bodega["linea_disponible"], total)
+        return [{"signal": "CARRITO", "items_text": _cart_items_text(cart), "total": total, "financiable": financiable}]
+
+    # ═══════════════════════════════════════════════
+    # FINANCIAMIENTO: MONTO
+    # ═══════════════════════════════════════════════
+    if fase == "fin_amt":
+        cart = datos.get("cart", [])
+        cart_total = _cart_total(cart)
+        max_fin = min(bodega["linea_disponible"], cart_total)
+
+        if body_n in ("VOLVER", "AGREGAR", "agregar_mas"):
+            db.upsert_session(telefono, "catalogo", datos, bodega["id"])
+            return [{"signal": "CATEGORIAS"}]
+
+        amount = None
+        if body_n in ("FIN_100", "fin_100", "1", "TOTAL"):
+            amount = max_fin
+        elif body_n in ("FIN_50", "fin_50", "2", "50%"):
+            amount = round(max_fin * 0.5, 2)
+        elif body_n in ("FIN_25", "fin_25", "3", "25%"):
+            amount = round(max_fin * 0.25, 2)
+
+        if amount:
+            datos["finance_amount"] = amount
+            terms = fees.get_all_term_options(amount)
+            datos["terms"] = terms
+            db.upsert_session(telefono, "fin_term", datos, bodega["id"])
+            return [{
+                "signal": "PLAZO",
+                "monto": amount,
+                "fee7": terms[0]["fee"], "total7": terms[0]["total"],
+                "fee15": terms[1]["fee"], "total15": terms[1]["total"],
+                "fee30": terms[2]["fee"], "total30": terms[2]["total"],
+            }]
+
+        return [{"signal": "MONTO", "linea": bodega["linea_disponible"], "total": cart_total, "financiable": max_fin}]
+
+    # ═══════════════════════════════════════════════
+    # FINANCIAMIENTO: PLAZO
+    # ═══════════════════════════════════════════════
+    if fase == "fin_term":
+        terms = datos.get("terms", [])
+        selected = None
+
+        plazo_map = {
+            "PLAZO_7": 0, "plazo_7": 0, "1": 0, "7 DIAS": 0,
+            "PLAZO_15": 1, "plazo_15": 1, "2": 1, "15 DIAS": 1,
+            "PLAZO_30": 2, "plazo_30": 2, "3": 2, "30 DIAS": 2,
+        }
+
+        idx = plazo_map.get(body_n) or plazo_map.get(body_raw)
+        if idx is not None and idx < len(terms):
+            selected = terms[idx]
+
+        if selected:
+            datos["selected_term"] = selected
+            cart = datos.get("cart", [])
+            cart_total = _cart_total(cart)
+            fin_amt = datos["finance_amount"]
+            contado = cart_total - fin_amt
+            venc = (date.today() + timedelta(days=selected["days"])).strftime("%d/%m/%Y")
+            db.upsert_session(telefono, "pin_confirm", datos, bodega["id"])
+            return [
+                msg.msg_confirmar_pin(
+                    cart_total, fin_amt, selected["fee"], selected["total"],
+                    selected["days"], venc, contado,
+                )
+            ]
+
+        # Re-show plazo options
+        amount = datos.get("finance_amount", 0)
+        if terms:
+            return [{
+                "signal": "PLAZO",
+                "monto": amount,
+                "fee7": terms[0]["fee"], "total7": terms[0]["total"],
+                "fee15": terms[1]["fee"], "total15": terms[1]["total"],
+                "fee30": terms[2]["fee"], "total30": terms[2]["total"],
+            }]
+        return [msg.msg_finance_terms(amount, terms)]
+
+    # ═══════════════════════════════════════════════
+    # CONFIRMAR PIN
+    # ═══════════════════════════════════════════════
+    if fase == "pin_confirm":
+        if body_n == "OK":
+            pedido_id = datos.get("pedido_id")
+            pedido_numero = datos.get("pedido_numero")
+
+            if pedido_id:
+                db.upsert_session(telefono, "menu", {}, bodega["id"])
+                return [
+                    msg.msg_status(pedido_numero or "tu pedido", "aprobado", "Tu distribuidor preparará tu pedido pronto. 📦"),
+                    {"signal": "MENU", "linea": bodega["linea_disponible"]},
+                ]
+
+            pedidos = db.get_pedidos_activos(bodega["id"])
+            recientes = [p for p in pedidos if p["estado"] in ("confirmado", "aprobado")]
+            if recientes:
+                db.upsert_session(telefono, "menu", {}, bodega["id"])
+                p = recientes[-1]
+                return [
+                    msg.msg_status(p["numero"], p["estado"], "Tu pedido está en proceso. 📦"),
+                    {"signal": "MENU", "linea": bodega["linea_disponible"]},
+                ]
+
+            pin_url = get_pin_url(bodega["id"], "confirm")
+            return [f"⚠️ Aún no pudimos cerrar la confirmación.\n\nIntenta otra vez aquí:\n👉 {pin_url}"]
+
+        pin_url = get_pin_url(bodega["id"], "confirm")
+        return [
+            f"🔐 *Confirma tu pedido*\n\nUsa el teclado seguro aquí:\n👉 {pin_url}\n\nCuando termines, vuelve a WhatsApp para continuar."
+        ]
+
+    # ═══ DEFAULT ═══
+    if bodega and bodega["estado"] == "activo":
+        db.upsert_session(telefono, "menu", {}, bodega["id"])
+        return [{"signal": "MENU", "linea": bodega["linea_disponible"]}]
+
+    return [msg.msg_no_entiendo()]
