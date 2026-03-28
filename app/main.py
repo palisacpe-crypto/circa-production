@@ -35,7 +35,7 @@ import logging, json, os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("circa")
 
-app = FastAPI(title="Circa MVP", version="2.2.0")
+app = FastAPI(title="Circa MVP", version="2.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -153,26 +153,31 @@ async def twilio_webhook(
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "circa-mvp", "version": "2.2.0"}
+    return {"status": "ok", "service": "circa-mvp", "version": "2.3.0"}
 
 @app.get("/api/debug")
 async def debug_check():
     """Temporary debug endpoint — remove after fixing."""
-    results = {}
-    tables = ["sesiones", "bodegas", "distribuidores", "catalogo", "carritos", "pedidos", "items_pedido", "pagos", "eventos", "recordatorios"]
+    import os
+    key = os.getenv("SUPABASE_SERVICE_KEY", "")
+    url = os.getenv("SUPABASE_URL", "")
+    results = {
+        "_key_info": {
+            "length": len(key),
+            "first_20": key[:20],
+            "last_10": key[-10:] if len(key) > 10 else key,
+            "has_newlines": "\n" in key,
+            "has_spaces": " " in key,
+            "url": url,
+        }
+    }
+    tables = ["sesiones", "bodegas"]
     for t in tables:
         try:
             r = db.sb.table(t).select("*").limit(1).execute()
             results[t] = {"ok": True, "rows": len(r.data)}
         except Exception as e:
-            results[t] = {"ok": False, "error": str(e)}
-    # Also test the exact webhook flow
-    try:
-        from app.state_machine import handle_message
-        resp = handle_message("+51000000000", "hola", None)
-        results["_webhook_simulation"] = {"ok": True, "responses": [str(r)[:100] for r in resp]}
-    except Exception as e:
-        results["_webhook_simulation"] = {"ok": False, "error": str(e), "type": type(e).__name__}
+            results[t] = {"ok": False, "error": str(e)[:200]}
     return results
 
 @app.get("/api/pedidos")
