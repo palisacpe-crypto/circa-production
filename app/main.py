@@ -35,7 +35,7 @@ import logging, json, os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("circa")
 
-app = FastAPI(title="Circa MVP", version="2.1.0")
+app = FastAPI(title="Circa MVP", version="2.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -153,7 +153,7 @@ async def twilio_webhook(
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "circa-mvp", "version": "2.1.0"}
+    return {"status": "ok", "service": "circa-mvp", "version": "2.2.0"}
 
 @app.get("/api/debug")
 async def debug_check():
