@@ -135,6 +135,9 @@ async def twilio_webhook(
         return PlainTextResponse(str(twiml), media_type="text/xml")
 
     except Exception as e:
+        import traceback
+        print(f"❌ WEBHOOK ERROR: {type(e).__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
         logger.error(f"❌ Error: {e}", exc_info=True)
         try:
             send_whatsapp(telefono, "⚠️ Hubo un error. Intenta de nuevo en un momento.")
@@ -151,6 +154,26 @@ async def twilio_webhook(
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "service": "circa-mvp", "version": "2.1.0"}
+
+@app.get("/api/debug")
+async def debug_check():
+    """Temporary debug endpoint — remove after fixing."""
+    results = {}
+    tables = ["sesiones", "bodegas", "distribuidores", "catalogo", "carritos", "pedidos", "items_pedido", "pagos", "eventos", "recordatorios"]
+    for t in tables:
+        try:
+            r = db.sb.table(t).select("*").limit(1).execute()
+            results[t] = {"ok": True, "rows": len(r.data)}
+        except Exception as e:
+            results[t] = {"ok": False, "error": str(e)}
+    # Also test the exact webhook flow
+    try:
+        from app.state_machine import handle_message
+        resp = handle_message("+51000000000", "hola", None)
+        results["_webhook_simulation"] = {"ok": True, "responses": [str(r)[:100] for r in resp]}
+    except Exception as e:
+        results["_webhook_simulation"] = {"ok": False, "error": str(e), "type": type(e).__name__}
+    return results
 
 @app.get("/api/pedidos")
 async def list_pedidos(estado: str = None):
